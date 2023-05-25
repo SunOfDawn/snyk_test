@@ -1,0 +1,19 @@
+[[package]]
+name = "requests"
+version = "2.25.1"
+description = "Python HTTP library"
+category = "main"
+optional = false
+python-versions = "*"
+...
+[[package]]
+name = "numpy"
+version = "1.20.2"
+description = "NumPy is the fundamental package for array computing with Python"
+category = "main"
+optional = false
+python-versions = "*"
+...
+
+[metadata]
+content-hash = "1234567890abcdef"
