@@ -1,0 +1,317 @@
+import com.bmuschko.gradle.docker.tasks.image.Dockerfile
+
+buildscript {
+    ext {
+        springBootVersion = '2.6.6'
+        dockerJavaVersion = '3.2.13'
+        junitPlatformCustomTestTags = 'docker, battery'
+        javaTargetCompatibility = 8
+        javaSourceCompatibility = 8
+    }
+    apply from: "https://raw.githubusercontent.com/blackducksoftware/integration-resources/master/gradle_common/buildscript-repositories.gradle", to: buildscript
+    apply from: "https://raw.githubusercontent.com/blackducksoftware/integration-resources/master/gradle_common/buildscript-dependencies.gradle", to: buildscript
+
+    // TODO don't seem to need this repositories
+//    repositories {
+//        mavenLocal()
+//        maven { url "https://maven.aliyun.com/nexus/content/repositories/central" }
+//        maven { url "https://sig-repo.synopsys.com/bds-integrations-release" }
+//        mavenCentral()
+//        maven { url 'https://plugins.gradle.org/m2/' }
+//        gradlePluginPortal()
+//    }
+//    dependencies {
+//        classpath("org.springframework.boot:spring-boot-gradle-plugin:${springBootVersion}")
+//        classpath 'com.bmuschko:gradle-docker-plugin:6.7.0'
+//        classpath 'org.freemarker:freemarker:2.3.31'
+//        classpath 'com.synopsys.integration:common-gradle-plugin:1.12.0'
+//    }
+}
+plugins {
+    id 'org.springframework.boot' version "${springBootVersion}" apply false
+    id "com.dorongold.task-tree" version "2.1.0"
+}
+
+project.ext.inspectorImageFamily = "docker-imageinspector"
+project.ext.inspectorImageVersion = "5.0.14"
+
+def ver = '10.0.2'
+version = ver
+
+apply plugin: 'org.springframework.boot'
+apply plugin: 'io.spring.dependency-management'
+apply plugin: 'com.bmuschko.docker-remote-api'
+apply plugin: 'com.synopsys.integration.solution'
+
+apply from: 'airgap.gradle'
+
+springBoot { mainClass = 'com.softsafe.sca.docker.dockerinspector.DockerInspector' }
+
+// By default, starting in 2.5.0, spring boot creates an extra "plain" .jar that we don't want
+jar {
+    enabled = false
+}
+
+def createArtifactName() {
+    return "${buildDir}/libs/${project.name}-${version}.jar"
+}
+
+repositories {
+    maven { url "https://sig-repo.synopsys.com/bds-bdio-release" }
+}
+
+// TODO if we s/compile/implementation/, can this go?:
+configurations {
+    integrationTestCompile.extendsFrom testCompile
+    integrationTestRuntime.extendsFrom testRuntime
+}
+
+dependencies {
+    implementation "com.synopsys.integration:integration-rest:10.3.6"
+    implementation 'com.softsafe.sca:docker-imageinspector-lib:14.1.5-SNAPSHOT'
+    implementation 'ch.qos.logback:logback-classic:1.2.11'
+
+    implementation "com.github.docker-java:docker-java-core:${dockerJavaVersion}"
+    implementation "com.github.docker-java:docker-java-transport-httpclient5:${dockerJavaVersion}"
+
+    implementation 'org.springframework.boot:spring-boot-starter'
+    implementation group: 'org.freemarker', name: 'freemarker', version: '2.3.31'
+
+    testImplementation 'org.springframework.boot:spring-boot-starter-test'
+    testImplementation 'io.fabric8:kubernetes-client:3.1.8'
+    testImplementation 'io.fabric8:kubernetes-model:2.0.8'
+}
+
+publishing {
+    publications {
+//        mavenJava(MavenPublication) {
+//            artifact("${createArtifactName()}")
+//        }
+        maven(MavenPublication) {
+            groupId = 'com.softsafe.sca'
+            artifactId = 'scanner-docker-inspector'
+            version = ver
+            from components.java
+        }
+    }
+}
+
+test {
+    enabled(false)
+}
+
+artifactory {
+    publish {
+        defaults { publications('mavenJava') }
+    }
+}
+
+task writeVersionToPropertiesFile() {
+    doLast {
+        println '\tChecking version properties'
+        File versionPropertiesHashFile = new File('src/main/resources/version.hashcode')
+        String existingHash = versionPropertiesHashFile.text
+
+        Properties versionProperties = new Properties()
+        versionProperties.setProperty('program.version', version)
+        versionProperties.setProperty('inspector.image.family', project.ext.inspectorImageFamily)
+        versionProperties.setProperty('inspector.image.version', project.ext.inspectorImageVersion)
+
+        int versionPropertiesHashCode = versionProperties.hashCode()
+        if (!Integer.toString(versionPropertiesHashCode).equals(existingHash)) {
+            println '\tGenerating version properties file'
+            File versionPropertiesFile = new File('src/main/resources/version.properties')
+            versionPropertiesFile.delete()
+            versionPropertiesFile.createNewFile()
+            versionProperties.store(versionPropertiesFile.newWriter(), null)
+            versionPropertiesHashFile.delete()
+            versionPropertiesHashFile.createNewFile()
+            versionPropertiesHashFile.text = versionPropertiesHashCode
+        }
+    }
+}
+
+task produceFinalZip(type: Zip, dependsOn: [build, writeVersionToPropertiesFile]) {
+    from("${buildDir}/libs") { include '*.jar' }
+    from("${projectDir}/src/main/resources") {
+        include 'application.properties'
+        into 'config'
+    }
+}
+
+def generatedDocPath = "docs/generated"
+
+task docsClean(type: Delete) {
+    delete "${generatedDocPath}"
+}
+
+task docsPrep() {
+    doLast {
+        project.file("${generatedDocPath}").mkdirs()
+    }
+}
+
+task docs(type: Exec, dependsOn: [docsPrep, bootJar]) {
+    ignoreExitValue true
+    commandLine "java", "-jar", "${createArtifactName()}", "--help", "--help.output.path=${generatedDocPath}"
+}
+
+
+task servedocs() {
+    dependsOn docs
+
+    doLast {
+        exec {
+            commandLine 'mkdocs', 'serve'
+            workingDir "docs"
+        }
+    }
+}
+
+task signJar() {
+    dependsOn build
+    finalizedBy 'verifyJar'
+    doLast {
+        exec {
+            commandLine 'jarsigner', '-tsa', 'http://rfc3161timestamp.globalsign.com/advanced', '-storetype', 'pkcs12', '-storepass', "${jarSigningKeystorePassword}", '-keystore', "${jarSigningKeystorePath}", "${createArtifactName()}", "${jarSigningCertificateAlias}"
+        }
+    }
+}
+
+task verifyJar() {
+    dependsOn signJar
+    doLast {
+        exec {
+            // returns 0 if successfully verified as signed; non-0 if not
+            commandLine 'jarsigner', '-verify', '-strict', "${createArtifactName()}"
+        }
+    }
+}
+
+artifactoryPublish.dependsOn signJar
+
+task removeTestImage(type: Exec) {
+    ignoreExitValue true
+    commandLine "docker", "rmi", "softsafe/centos_minus_vim_plus_bacula:1.0"
+}
+
+task removeTestBaseImage(type: Exec) {
+    ignoreExitValue true
+    commandLine "docker", "rmi", "centos@sha256:773bb32cbd1d171da7df52de8d7b731320748707b821bdbabb885d6eda894e87"
+}
+
+task createTestImagesDir() {
+    doLast {
+        File imagesDir = new File("${buildDir}", "images")
+        File testImagesDir = new File("${imagesDir}", "test")
+        testImagesDir.mkdirs()
+    }
+}
+
+task createTestDockerfile(type: Dockerfile, dependsOn: createTestImagesDir) {
+    destFile = project.file("${buildDir}/images/test/centos_minus_vim_plus_bacula/Dockerfile")
+    println "destFile: ${destFile}"
+    from 'centos@sha256:773bb32cbd1d171da7df52de8d7b731320748707b821bdbabb885d6eda894e87'
+    environmentVariable('LANG', 'en_US.UTF-8')
+
+    runCommand 'rpm -e vim-minimal && \
+        yum install -y bacula-director-5.2.13-23.1.el7 bacula-storage-5.2.13-23.1.el7 bacula-client-5.2.13-23.1.el7 \
+        bacula-console-5.2.13-23.1.el7'
+}
+
+task buildTestDockerImage(type: Exec, dependsOn: [removeTestBaseImage, removeTestImage, createTestImagesDir, createTestDockerfile]) {
+    commandLine "docker", "build", "--no-cache", "--tag", "softsafe/centos_minus_vim_plus_bacula:1.0",        \
+               "${buildDir}/images/test/centos_minus_vim_plus_bacula"
+}
+
+task buildTestDockerTarfile(type: Exec, dependsOn: [createTestImagesDir, buildTestDockerImage]) {
+    outputs.files file("${buildDir}/images/test/centos_minus_vim_plus_bacula.tar")
+    commandLine "docker", "save", "-o", "${buildDir}/images/test/centos_minus_vim_plus_bacula.tar",        \
+               "softsafe/centos_minus_vim_plus_bacula:1.0"
+}
+
+task createWhTestDockerfile(type: Dockerfile, dependsOn: createTestImagesDir) {
+    destFile = project.file("${buildDir}/images/test/whiteouttest/Dockerfile")
+    println "destFile: ${destFile}"
+    from 'ubuntu@sha256:3097ac92b852f878f802c22a38f97b097b4084dbef82893ba453ba0297d76a6a'
+    environmentVariable('LANG', 'en_US.UTF-8')
+
+    runCommand 'apt-get update && apt-get -y install curl && apt-get -y remove curl && apt-get -y clean'
+}
+
+task removeWhImage(type: Exec) {
+    ignoreExitValue true
+    commandLine "docker", "rmi", "softsafe/whiteouttest:1.0"
+}
+
+task removeWhBaseImage(type: Exec) {
+    ignoreExitValue true
+    commandLine "docker", "rmi", "ubuntu@sha256:3097ac92b852f878f802c22a38f97b097b4084dbef82893ba453ba0297d76a6a"
+}
+
+task buildWhTestDockerImage(type: Exec, dependsOn: [removeWhBaseImage, removeWhImage, createTestImagesDir, createWhTestDockerfile]) {
+    commandLine "docker", "build", "--no-cache", "--tag", "softsafe/whiteouttest:1.0", "${buildDir}/images/test/whiteouttest"
+}
+
+task buildWhTestDockerTarfile(type: Exec, dependsOn: buildWhTestDockerImage) {
+    commandLine "docker", "save", "-o", "${buildDir}/images/test/whiteouttest.tar", "softsafe/whiteouttest:1.0"
+}
+
+task pullAlpineLatest(type: Exec) {
+    commandLine "docker", "pull", "alpine:latest"
+}
+
+task pullAlpine36(type: Exec) {
+    commandLine "docker", "pull", "alpine@sha256:de5701d6a3a36dc6a5db260d21be0422fd30dd2d158c1e048b34263e73205cb6"
+}
+
+task pullUbuntu1404(type: Exec) {
+    commandLine "docker", "pull", "ubuntu@sha256:71529e96591eb36a4100cd0cc5353ff1a2f4ee7a85011e3d3dd07cb5eb524a3e"
+}
+
+task buildAlpineTestDockerTarfile(type: Exec, dependsOn: [pullAlpineLatest, createTestImagesDir]) {
+    commandLine "docker", "save", "-o", "${buildDir}/images/test/alpine.tar", "alpine:latest"
+}
+
+task buildUbuntuTestDockerTarfile(type: Exec, dependsOn: [pullUbuntu1404, createTestImagesDir]) {
+    commandLine "docker", "save", "-o", "${buildDir}/images/test/ubuntu1404.tar", "ubuntu@sha256:71529e96591eb36a4100cd0cc5353ff1a2f4ee7a85011e3d3dd07cb5eb524a3e"
+}
+
+task buildAlpine36TestDockerTarfile(type: Exec, dependsOn: [pullAlpine36, createTestImagesDir]) {
+    commandLine "docker", "save", "-o", "${buildDir}/images/test/alpine36.tar", "alpine@sha256:de5701d6a3a36dc6a5db260d21be0422fd30dd2d158c1e048b34263e73205cb6"
+}
+
+task buildAggTestDockerTarfile(type: Exec, dependsOn: [createTestImagesDir, buildTestDockerImage, buildWhTestDockerImage]) {
+    commandLine "docker", "save", "-o", "${buildDir}/images/test/aggregated.tar", "softsafe/centos_minus_vim_plus_bacula:1.0", "softsafe/whiteouttest:1.0"
+}
+
+build.dependsOn docs
+clean.dependsOn docsClean
+compileJava.dependsOn writeVersionToPropertiesFile
+
+task checkVersion() {
+    doFirst {
+        println "Checking to make sure this version (${version}) is a release version"
+        if ((version.contains("-SNAPSHOT")) || (version.contains("-RC"))) {
+            println "Throwing exception to terminate this build"
+            throw new InvalidUserDataException("This version (${version}) looks like a snapshot or release candidate; failing build")
+        }
+    }
+}
+
+task buildTestTarfiles(dependsOn: [buildTestDockerTarfile, buildWhTestDockerTarfile, buildAggTestDockerTarfile,        \
+               buildAlpineTestDockerTarfile, buildAlpine36TestDockerTarfile, buildUbuntuTestDockerTarfile]) {}
+
+task testPrep(dependsOn: [docs, buildTestTarfiles]) {
+    doLast {
+        project.file('test/containerShared/target').mkdirs()
+        project.file('test/containerShared/output').mkdirs()
+    }
+}
+
+task cleanExtras(type: Delete, dependsOn: docsClean) {
+    delete 'test', 'out'
+}
+
+clean.dependsOn cleanExtras
+test.dependsOn testPrep
